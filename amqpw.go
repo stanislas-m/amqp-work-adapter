@@ -8,6 +8,7 @@ import (
 
 	"github.com/gobuffalo/buffalo/worker"
 	"github.com/markbates/going/defaults"
+	"github.com/markbates/going/randx"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/streadway/amqp"
@@ -140,7 +141,7 @@ func (q *Adapter) Register(name string, h worker.Handler) error {
 
 	msgs, err := q.Channel.Consume(
 		name,
-		q.consumerName,
+		fmt.Sprintf("%s_%s_%s", q.consumerName, name, randx.String(20)),
 		false, // auto-ack
 		false, // exclusive
 		false, // no-local
