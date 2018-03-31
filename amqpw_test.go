@@ -2,7 +2,6 @@ package amqpw
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"os"
 	"sync"
@@ -67,7 +66,6 @@ func TestMain(m *testing.M) {
 }
 
 func Test_Perform(t *testing.T) {
-	fmt.Println("Test_Perform")
 	r := require.New(t)
 
 	var hit bool
@@ -86,7 +84,6 @@ func Test_Perform(t *testing.T) {
 }
 
 func Test_PerformMultiple(t *testing.T) {
-	fmt.Println("Test_Perform")
 	r := require.New(t)
 
 	var hitPerform1, hitPerform2 bool
@@ -114,7 +111,6 @@ func Test_PerformMultiple(t *testing.T) {
 }
 
 func Test_PerformAt(t *testing.T) {
-	fmt.Println("Test_PerformAt")
 	r := require.New(t)
 
 	var hit bool
@@ -133,7 +129,6 @@ func Test_PerformAt(t *testing.T) {
 }
 
 func Test_PerformIn(t *testing.T) {
-	fmt.Println("Test_PerformIn")
 	r := require.New(t)
 
 	var hit bool
