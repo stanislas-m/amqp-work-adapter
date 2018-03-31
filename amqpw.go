@@ -119,6 +119,7 @@ func (q *Adapter) Register(name string, h worker.Handler) error {
 			}
 			if err := h(args); err != nil {
 				q.Logger.Errorf("Unable to process job %s", name)
+				continue
 			}
 			if err := d.Ack(false); err != nil {
 				q.Logger.Errorf("Unable to Ack job %s", name)
