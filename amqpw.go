@@ -23,6 +23,8 @@ type Options struct {
 	Name string
 	// Exchange is used to customize the AMQP exchange name. Defaults to "".
 	Exchange string
+	// MaxConcurrency restricts the amount of workers in parallel.
+	MaxConcurrency int
 }
 
 // ErrInvalidConnection is returned when the Connection opt is not defined.
@@ -36,6 +38,7 @@ func New(opts Options) *Adapter {
 	ctx := context.Background()
 
 	opts.Name = defaults.String(opts.Name, "buffalo")
+	opts.MaxConcurrency = defaults.Int(opts.MaxConcurrency, 25)
 
 	if opts.Logger == nil {
 		l := logrus.New()
@@ -45,22 +48,24 @@ func New(opts Options) *Adapter {
 	}
 
 	return &Adapter{
-		Connection:   opts.Connection,
-		Logger:       opts.Logger,
-		consumerName: opts.Name,
-		exchange:     opts.Exchange,
-		ctx:          ctx,
+		Connection:     opts.Connection,
+		Logger:         opts.Logger,
+		consumerName:   opts.Name,
+		exchange:       opts.Exchange,
+		maxConcurrency: opts.MaxConcurrency,
+		ctx:            ctx,
 	}
 }
 
 // Adapter implements the buffalo.Worker interface.
 type Adapter struct {
-	Connection   *amqp.Connection
-	Channel      *amqp.Channel
-	Logger       Logger
-	consumerName string
-	exchange     string
-	ctx          context.Context
+	Connection     *amqp.Connection
+	Channel        *amqp.Channel
+	Logger         Logger
+	consumerName   string
+	exchange       string
+	ctx            context.Context
+	maxConcurrency int
 }
 
 // Start connects to the broker.
@@ -80,8 +85,26 @@ func (q *Adapter) Start(ctx context.Context) error {
 	// Start new broker channel
 	c, err := q.Connection.Channel()
 	if err != nil {
-		return err
+		return errors.WithStack(err)
 	}
+
+	// Declare exchange
+	if q.exchange != "" {
+		err = c.ExchangeDeclare(
+			q.exchange, // Name
+			"direct",   // Type
+			true,       // Durable
+			false,      // Auto-deleted
+			false,      // Internal
+			false,      // No wait
+			nil,        // Args
+		)
+
+		if err != nil {
+			return errors.WithMessage(err, "unable to declare exchange")
+		}
+	}
+
 	q.Channel = c
 	return nil
 }
@@ -89,11 +112,32 @@ func (q *Adapter) Start(ctx context.Context) error {
 // Stop closes the connection to the broker.
 func (q *Adapter) Stop() error {
 	q.Logger.Info("Stopping AMQP Worker")
-	return q.Channel.Close()
+	if q.Channel == nil {
+		return nil
+	}
+	if err := q.Channel.Close(); err != nil {
+		return err
+	}
+	return q.Connection.Close()
 }
 
 // Register consumes a task, using the declared worker.Handler
 func (q *Adapter) Register(name string, h worker.Handler) error {
+	q.Logger.Infof("Register job \"%s\"", name)
+
+	_, err := q.Channel.QueueDeclare(
+		name,
+		true,
+		false,
+		false,
+		false,
+		amqp.Table{},
+	)
+
+	if err != nil {
+		return errors.WithMessage(err, "unable to create queue")
+	}
+
 	msgs, err := q.Channel.Consume(
 		name,
 		q.consumerName,
@@ -108,23 +152,29 @@ func (q *Adapter) Register(name string, h worker.Handler) error {
 		return errors.WithStack(err)
 	}
 
+	// Process jobs with maxConcurrency workers
+	sem := make(chan bool, q.maxConcurrency)
 	go func() {
 		for d := range msgs {
-			q.Logger.Debugf("Received job %s: %s", name, d.Body)
+			sem <- true
+			q.Logger.Debugf("Received job \"%s\": %s", name, d.Body)
 
 			args := worker.Args{}
 			err := json.Unmarshal(d.Body, &args)
 			if err != nil {
-				q.Logger.Errorf("Unable to retreive job %s args", name)
+				q.Logger.Errorf("Unable to retreive job \"%s\" args", name)
 				continue
 			}
 			if err := h(args); err != nil {
-				q.Logger.Errorf("Unable to process job %s", name)
+				q.Logger.Errorf("Unable to process job \"%s\"", name)
 				continue
 			}
 			if err := d.Ack(false); err != nil {
-				q.Logger.Errorf("Unable to Ack job %s", name)
+				q.Logger.Errorf("Unable to Ack job \"%s\"", name)
 			}
+		}
+		for i := 0; i < cap(sem); i++ {
+			sem <- true
 		}
 	}()
 
@@ -133,13 +183,13 @@ func (q *Adapter) Register(name string, h worker.Handler) error {
 
 // Perform enqueues a new job.
 func (q Adapter) Perform(job worker.Job) error {
-	q.Logger.Infof("Enqueuing job %s\n", job)
+	q.Logger.Infof("Enqueuing job %s", job)
 
 	err := q.Channel.Publish(
 		q.exchange,  // exchange
 		job.Handler, // routing key
 		true,        // mandatory
-		true,        // immediate
+		false,       // immediate
 		amqp.Publishing{
 			ContentType:  "application/json",
 			DeliveryMode: amqp.Persistent,
@@ -148,7 +198,7 @@ func (q Adapter) Perform(job worker.Job) error {
 	)
 
 	if err != nil {
-		q.Logger.Errorf("error enqueuing job %s", job)
+		q.Logger.Errorf("error enqueuing job \"%s\"", job)
 		return errors.WithStack(err)
 	}
 	return nil
@@ -156,7 +206,7 @@ func (q Adapter) Perform(job worker.Job) error {
 
 // PerformIn performs a job delayed by the given duration.
 func (q Adapter) PerformIn(job worker.Job, t time.Duration) error {
-	q.Logger.Infof("Enqueuing job %s\n", job)
+	q.Logger.Infof("Enqueuing job %s", job)
 	d := int64(t / time.Second)
 
 	// Trick broker using x-dead-letter feature:
@@ -164,8 +214,8 @@ func (q Adapter) PerformIn(job worker.Job, t time.Duration) error {
 	// When the TTL expires, the message is forwarded to the original queue.
 	dq, err := q.Channel.QueueDeclare(
 		fmt.Sprintf("%s_delayed_%d", job.Handler, d),
-		false, // This is a temp queue
-		true,  // Auto-deletion
+		true, // Save on disk
+		true, // Auto-deletion
 		false,
 		true,
 		amqp.Table{
@@ -176,15 +226,16 @@ func (q Adapter) PerformIn(job worker.Job, t time.Duration) error {
 	)
 
 	if err != nil {
-		q.Logger.Errorf("error creating delayed temp queue for job %s", job)
-		return errors.WithStack(err)
+		m := errors.WithMessage(err, fmt.Sprintf("error creating delayed temp queue for job %s", job.Handler))
+		q.Logger.Error(m)
+		return err
 	}
 
 	err = q.Channel.Publish(
 		q.exchange, // exchange
 		dq.Name,    // publish to temp delayed queue
 		true,       // mandatory
-		true,       // immediate
+		false,      // immediate
 		amqp.Publishing{
 			ContentType:  "application/json",
 			DeliveryMode: amqp.Persistent,
@@ -193,8 +244,9 @@ func (q Adapter) PerformIn(job worker.Job, t time.Duration) error {
 	)
 
 	if err != nil {
-		q.Logger.Errorf("error enqueuing job %s", job)
-		return errors.WithStack(err)
+		m := errors.WithMessage(err, fmt.Sprintf("error enqueuing job %s", job.Handler))
+		q.Logger.Error(m)
+		return err
 	}
 	return nil
 }
