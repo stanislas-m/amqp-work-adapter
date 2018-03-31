@@ -3,6 +3,7 @@ package amqpw
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/gobuffalo/buffalo/worker"
@@ -158,15 +159,33 @@ func (q Adapter) PerformIn(job worker.Job, t time.Duration) error {
 	q.Logger.Infof("Enqueuing job %s\n", job)
 	d := int64(t / time.Second)
 
-	err := q.Channel.Publish(
-		q.exchange,  // exchange
-		job.Handler, // routing key
-		true,        // mandatory
-		true,        // immediate
+	// Trick broker using x-dead-letter feature:
+	// the message will be pushed in a temp queue with the given duration as TTL.
+	// When the TTL expires, the message is forwarded to the original queue.
+	dq, err := q.Channel.QueueDeclare(
+		fmt.Sprintf("%s_delayed_%d", job.Handler, d),
+		false, // This is a temp queue
+		true,  // Auto-deletion
+		false,
+		true,
+		amqp.Table{
+			"x-message-ttl":             d,
+			"x-dead-letter-exchange":    "",
+			"x-dead-letter-routing-key": job.Handler,
+		},
+	)
+
+	if err != nil {
+		q.Logger.Errorf("error creating delayed temp queue for job %s", job)
+		return errors.WithStack(err)
+	}
+
+	err = q.Channel.Publish(
+		q.exchange, // exchange
+		dq.Name,    // publish to temp delayed queue
+		true,       // mandatory
+		true,       // immediate
 		amqp.Publishing{
-			Headers: amqp.Table{
-				"x-delay": d,
-			},
 			ContentType:  "application/json",
 			DeliveryMode: amqp.Persistent,
 			Body:         []byte(job.Args.String()),
